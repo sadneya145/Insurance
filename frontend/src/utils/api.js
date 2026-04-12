@@ -1,8 +1,8 @@
 import axios from 'axios';
 
-// Create axios instance
+// Create axios instance //'http://localhost:5000/api', // backend server
 const API = axios.create({
-  baseURL: 'http://localhost:5000/api', // backend server
+  baseURL: 'https://insurance-backend-ng4r.onrender.com', 
   withCredentials: true,
   headers: {
     'Content-Type': 'application/json',
