@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { claimAPI } from '../utils/api';
+import { useMetaMask } from '../pages/UseMetamask';
 
 const initForm = {
   policyId: '', claimantName: '', claimantEmail: '',
@@ -16,6 +17,9 @@ export default function Claims() {
   const [submitting, setSubmitting] = useState(false);
   const [alert, setAlert] = useState(null);
   const [lastResult, setLastResult] = useState(null);
+  const [txStep, setTxStep] = useState(null); // 'metamask' | 'backend' | null
+
+  const { account, isConnected, isCorrectNetwork, connect, sendTransaction, txPending, error: mmError } = useMetaMask();
 
   const load = async () => {
     try {
@@ -27,37 +31,130 @@ export default function Claims() {
 
   useEffect(() => { load(); }, []);
 
+  const ensureMetaMask = async () => {
+    if (!isConnected) {
+      const acc = await connect();
+      if (!acc) {
+        setAlert({ type: 'error', msg: 'Please connect MetaMask to continue.' });
+        return false;
+      }
+    }
+    if (!isCorrectNetwork) {
+      setAlert({ type: 'error', msg: 'Please switch to Sepolia testnet in MetaMask.' });
+      return false;
+    }
+    return true;
+  };
+
   const handleSubmit = async () => {
+    const ready = await ensureMetaMask();
+    if (!ready) return;
+
     setSubmitting(true);
     setAlert(null);
+    setTxStep('metamask');
+
     try {
-      const res = await claimAPI.create({ ...form, claimAmount: Number(form.claimAmount) });
-      setLastResult(res.data);
+      // Step 1: MetaMask Sepolia transaction for claim submission proof
+      const sepoliaTx = await sendTransaction({
+        type: 'CLAIM_SUBMITTED',
+        id: `CLAIM-${Date.now()}`,
+        amount: '0',
+        metadata: {
+          policyId: form.policyId,
+          claimantName: form.claimantName,
+          claimAmount: form.claimAmount,
+          incidentDate: form.incidentDate
+        }
+      });
+
+      if (!sepoliaTx) {
+        setAlert({ type: 'error', msg: mmError || 'MetaMask transaction rejected.' });
+        setSubmitting(false);
+        setTxStep(null);
+        return;
+      }
+
+      // Step 2: Backend claim creation with Sepolia proof
+      setTxStep('backend');
+      const res = await claimAPI.create({
+        ...form,
+        claimAmount: Number(form.claimAmount),
+        sepoliaTxHash: sepoliaTx.txHash,
+        sepoliaBlockNumber: sepoliaTx.blockNumber,
+        walletAddress: account
+      });
+
+      setLastResult({ ...res.data, sepoliaTx });
+
       const d = res.data.smartContracts;
-      const msg = d.autoClaim.decision === 'AUTO_APPROVED'
-        ? `✅ AUTO-APPROVED by Smart Contract! Claim ${res.data.data.claimId}`
-        : d.fraud.riskLevel === 'HIGH'
-        ? `⚠️ Fraud flagged! Score: ${d.fraud.fraudScore}/100`
-        : `Claim ${res.data.data.claimId} submitted for manual review.`;
-      setAlert({ type: d.autoClaim.decision === 'AUTO_APPROVED' ? 'success' : 'info', msg });
+      const msg = d?.autoClaim?.decision === 'AUTO_APPROVED'
+        ? `✅ AUTO-APPROVED! Sepolia TX confirmed. Claim ${res.data.data.claimId}`
+        : d?.fraud?.riskLevel === 'HIGH'
+        ? `⚠️ Fraud flagged! Score: ${d.fraud.fraudScore}/100 — Sepolia TX recorded.`
+        : `Claim ${res.data.data.claimId} submitted for manual review. Sepolia TX confirmed.`;
+
+      setAlert({ type: d?.autoClaim?.decision === 'AUTO_APPROVED' ? 'success' : 'info', msg });
       setShowModal(false);
       setForm(initForm);
       load();
     } catch (e) {
       setAlert({ type: 'error', msg: e.response?.data?.message || 'Failed to submit claim' });
-    } finally { setSubmitting(false); }
+    } finally {
+      setSubmitting(false);
+      setTxStep(null);
+    }
   };
 
   const handleDecide = async () => {
+    const ready = await ensureMetaMask();
+    if (!ready) return;
+
     setSubmitting(true);
+    setTxStep('metamask');
+
     try {
-      await claimAPI.decide(showDecide.claimId, { ...decideForm, approvedAmount: Number(decideForm.approvedAmount) });
-      setAlert({ type: 'success', msg: `Decision recorded on blockchain for ${showDecide.claimId}` });
+      // MetaMask TX for claim decision proof
+      const sepoliaTx = await sendTransaction({
+        type: 'CLAIM_DECISION',
+        id: showDecide.claimId,
+        amount: '0',
+        metadata: {
+          decision: decideForm.decision,
+          approvedAmount: decideForm.approvedAmount,
+          adjusterName: decideForm.adjusterName,
+          policyId: showDecide.policyId
+        }
+      });
+
+      if (!sepoliaTx) {
+        setAlert({ type: 'error', msg: mmError || 'MetaMask transaction rejected.' });
+        setSubmitting(false);
+        setTxStep(null);
+        return;
+      }
+
+      setTxStep('backend');
+      await claimAPI.decide(showDecide.claimId, {
+        ...decideForm,
+        approvedAmount: Number(decideForm.approvedAmount),
+        sepoliaTxHash: sepoliaTx.txHash,
+        sepoliaBlockNumber: sepoliaTx.blockNumber,
+        walletAddress: account
+      });
+
+      setAlert({
+        type: 'success',
+        msg: `Decision recorded on Sepolia (${sepoliaTx.txHash?.slice(0, 16)}...) and internal blockchain for ${showDecide.claimId}`
+      });
       setShowDecide(null);
       load();
     } catch (e) {
       setAlert({ type: 'error', msg: 'Failed to record decision' });
-    } finally { setSubmitting(false); }
+    } finally {
+      setSubmitting(false);
+      setTxStep(null);
+    }
   };
 
   const statusBadge = s => {
@@ -65,15 +162,45 @@ export default function Claims() {
     return <span className={`badge badge-${map[s] || 'info'}`}>{s.replace('_', ' ')}</span>;
   };
 
+  const shortAddress = (addr) => addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : '';
+
   return (
     <div>
       <div className="page-header">
         <h2 className="page-header-title">⚡ Claims Management</h2>
-        <button className="btn btn-primary" onClick={() => setShowModal(true)}>⊕ Submit Claim</button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {/* MetaMask Status */}
+          {isConnected && isCorrectNetwork ? (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              background: 'rgba(0,255,157,0.08)',
+              border: '1px solid rgba(0,255,157,0.3)',
+              borderRadius: 8, padding: '6px 14px', fontSize: 13
+            }}>
+              <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#00ff9d', boxShadow: '0 0 6px #00ff9d' }} />
+              <span style={{ color: '#00ff9d', fontFamily: 'monospace', fontSize: 12 }}>{shortAddress(account)}</span>
+              <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>Sepolia</span>
+            </div>
+          ) : (
+            <button
+              className="btn"
+              style={{
+                padding: '6px 16px', fontSize: 13,
+                background: 'linear-gradient(135deg, #f6851b, #e2761b)',
+                color: '#fff', border: 'none', borderRadius: 8, cursor: 'pointer', fontWeight: 600
+              }}
+              onClick={connect}
+            >
+              🦊 Connect MetaMask
+            </button>
+          )}
+          <button className="btn btn-primary" onClick={() => setShowModal(true)}>⊕ Submit Claim</button>
+        </div>
       </div>
 
       {alert && <div className={`alert alert-${alert.type}`}>{alert.msg}</div>}
 
+      {/* Smart Contract + Sepolia TX Result */}
       {lastResult && (
         <div className="card mb-6">
           <div className="card-title">🤖 Smart Contract Execution Results</div>
@@ -117,8 +244,35 @@ export default function Claims() {
               </div>
             </div>
           </div>
+
+          {/* Sepolia TX Details */}
+          {lastResult.sepoliaTx && (
+            <div style={{ marginTop: 16, padding: 14, background: 'rgba(246,133,27,0.08)', border: '1px solid rgba(246,133,27,0.3)', borderRadius: 8 }}>
+              <div style={{ fontSize: 12, color: '#f6851b', fontWeight: 700, letterSpacing: 1, marginBottom: 10 }}>
+                🦊 SEPOLIA TESTNET CONFIRMATION
+              </div>
+              <div className="grid-2" style={{ gap: 10, fontSize: 12 }}>
+                <div>
+                  <div className="stat-label">TX Hash</div>
+                  <a
+                    href={lastResult.sepoliaTx.explorerUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ color: '#00d4ff', textDecoration: 'none', fontFamily: 'monospace', fontSize: 11 }}
+                  >
+                    {lastResult.sepoliaTx.txHash?.slice(0, 30)}... ↗
+                  </a>
+                </div>
+                <div>
+                  <div className="stat-label">Sepolia Block</div>
+                  <div className="monospace text-cyan">#{lastResult.sepoliaTx.blockNumber}</div>
+                </div>
+              </div>
+            </div>
+          )}
+
           <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
-            <span className="stat-label">Block Hash: </span>
+            <span className="stat-label">Internal Block Hash: </span>
             <span className="hash-text">{lastResult.blockchain?.claimBlock?.hash}</span>
           </div>
         </div>
@@ -159,7 +313,19 @@ export default function Claims() {
                         </span>
                       )}
                     </td>
-                    <td><span className="hash-text" style={{ fontSize: 9 }}>#{c.blockIndex} {c.blockchainHash?.slice(0, 12)}...</span></td>
+                    <td>
+                      <div><span className="hash-text" style={{ fontSize: 9 }}>#{c.blockIndex} {c.blockchainHash?.slice(0, 12)}...</span></div>
+                      {c.sepoliaTxHash && (
+                        <a
+                          href={`https://sepolia.etherscan.io/tx/${c.sepoliaTxHash}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{ color: '#f6851b', fontSize: 9, fontFamily: 'monospace', textDecoration: 'none' }}
+                        >
+                          🦊 {c.sepoliaTxHash?.slice(0, 10)}...↗
+                        </a>
+                      )}
+                    </td>
                     <td>
                       {['PENDING', 'UNDER_REVIEW'].includes(c.status) && (
                         <button className="btn btn-outline" style={{ padding: '4px 10px', fontSize: 12 }}
@@ -176,10 +342,32 @@ export default function Claims() {
         </div>
       </div>
 
+      {/* Submit Claim Modal */}
       {showModal && (
         <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowModal(false)}>
           <div className="modal">
             <div className="modal-title">⚡ Submit New Claim</div>
+
+            {!isConnected && (
+              <div className="alert alert-info mb-4" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span>🦊 MetaMask required to submit claims.</span>
+                <button
+                  className="btn"
+                  style={{ padding: '4px 12px', fontSize: 12, background: '#f6851b', color: '#fff', border: 'none', borderRadius: 6 }}
+                  onClick={connect}
+                >
+                  Connect
+                </button>
+              </div>
+            )}
+
+            {txStep && (
+              <div className="alert alert-info mb-4" style={{ fontSize: 13 }}>
+                {txStep === 'metamask' && '🦊 Confirm the transaction in MetaMask (Sepolia)...'}
+                {txStep === 'backend' && '✅ Sepolia TX confirmed! Processing claim on internal blockchain...'}
+              </div>
+            )}
+
             <div className="form-grid mb-4">
               <div className="form-group">
                 <label className="form-label">Policy ID</label>
@@ -206,23 +394,36 @@ export default function Claims() {
               <label className="form-label">Description</label>
               <textarea className="form-textarea" value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="Describe the incident..." />
             </div>
-            <div className="alert alert-info" style={{ fontSize: 12 }}>
-              ⚡ Smart contracts will automatically run Fraud Detection + Auto-Claim Settlement on submission.
+
+            <div className="alert alert-info" style={{ fontSize: 12, marginBottom: 12 }}>
+              <strong>2-Step Process:</strong><br />
+              1️⃣ <strong>MetaMask</strong> → Confirm Sepolia TX (0 ETH, data-only proof)<br />
+              2️⃣ <strong>Smart Contracts</strong> → Fraud Detection + Auto-Claim + PoW block
             </div>
+
             <div className="modal-footer">
               <button className="btn btn-outline" onClick={() => setShowModal(false)}>Cancel</button>
-              <button className="btn btn-primary" onClick={handleSubmit} disabled={submitting}>
-                {submitting ? 'Processing...' : '⬡ Submit on Blockchain'}
+              <button className="btn btn-primary" onClick={handleSubmit} disabled={submitting || txPending}>
+                {txStep === 'metamask' ? '🦊 Confirm in MetaMask...' : txStep === 'backend' ? '⛏️ Processing...' : '⬡ Submit on Blockchain'}
               </button>
             </div>
           </div>
         </div>
       )}
 
+      {/* Decision Modal */}
       {showDecide && (
         <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowDecide(null)}>
           <div className="modal">
             <div className="modal-title">⚖️ Claim Decision — {showDecide.claimId}</div>
+
+            {txStep && (
+              <div className="alert alert-info mb-4" style={{ fontSize: 13 }}>
+                {txStep === 'metamask' && '🦊 Sign decision on Sepolia via MetaMask...'}
+                {txStep === 'backend' && '✅ Sepolia confirmed! Recording decision on internal chain...'}
+              </div>
+            )}
+
             <div className="form-grid mb-4">
               <div className="form-group">
                 <label className="form-label">Decision</label>
@@ -247,8 +448,8 @@ export default function Claims() {
             </div>
             <div className="modal-footer">
               <button className="btn btn-outline" onClick={() => setShowDecide(null)}>Cancel</button>
-              <button className="btn btn-success" onClick={handleDecide} disabled={submitting}>
-                {submitting ? 'Recording...' : '⬡ Record on Blockchain'}
+              <button className="btn btn-success" onClick={handleDecide} disabled={submitting || txPending}>
+                {txStep === 'metamask' ? '🦊 Confirm in MetaMask...' : txStep === 'backend' ? '⛓️ Recording...' : '⬡ Record on Blockchain'}
               </button>
             </div>
           </div>
